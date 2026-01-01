@@ -11,8 +11,11 @@
 
 
 #define PORT 8080
-#define WORKER_COUNT 32
+#define WORKER_COUNT 52
 #define QUEUE_SIZE 256
+#define CACHE_MAX_SIZE (10 * 1024 * 1024) 
+#define MAX_OBJECT_SIZE (512 * 1024)
+
 
 
 void handle_clients(int client_fd);
@@ -28,6 +31,125 @@ int queue_count = 0;
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
+
+typedef struct cache_entry {
+    char *key;                 
+    char *data;                
+    size_t size;
+
+    struct cache_entry *prev;
+    struct cache_entry *next;
+} cache_entry;
+
+
+cache_entry *cache_head = NULL;
+cache_entry *cache_tail = NULL;
+
+size_t cache_current_size = 0;
+
+pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void cache_move_to_front(cache_entry *e){ // entry
+    if(e == cache_head){
+        return;
+    }
+    if(e->prev){
+        e->prev->next = e->next;
+    }
+
+    if(e->next){
+        e->next->prev = e->prev;
+    }
+
+    if(e== cache_tail){
+        cache_tail = e->prev;
+    }
+
+    e->prev = NULL;
+    e->next = cache_head;
+
+    if(cache_head){
+        cache_head->prev = e;
+    }
+    
+    cache_head = e;
+
+    if(!cache_tail){
+        cache_tail = e;
+    }
+}
+
+
+void cache_evict(){
+    if(!cache_tail){
+        return;
+    }
+    cache_entry *e = cache_tail;
+
+    if(e->prev){
+        e->prev->next = NULL;
+    }
+    cache_tail = e->prev;
+
+    if(e==cache_head){
+        cache_head = NULL;
+    }
+    cache_current_size -= e->size;
+    free(e->key);
+    free(e->data);
+    free(e); 
+}
+
+cache_entry *cache_get(const char *key){
+    pthread_mutex_lock(&cache_mutex);
+
+    cache_entry *e = cache_head;
+    while(e){
+        if(strcmp(e->key,key)==0){
+            cache_move_to_front(e);
+            pthread_mutex_unlock(&cache_mutex);
+            return e;
+        }
+        e = e->next;
+    }
+    pthread_mutex_unlock(&cache_mutex);
+    return NULL;
+}
+
+
+void cache_put(const char *key,char *data,size_t size){
+    if(size>MAX_OBJECT_SIZE){
+        return;
+    }
+
+    pthread_mutex_lock(&cache_mutex);
+
+    while(cache_current_size + size >CACHE_MAX_SIZE){
+        cache_evict();
+    }
+
+    cache_entry *e = malloc(sizeof(cache_entry));
+    e->key = strdup(key);
+    e->data = data;
+    e->size = size;
+
+    e->prev = NULL;
+    e->next = cache_head;
+
+    if(cache_head){
+        cache_head->prev = e;
+    }
+    cache_head = e;
+
+    if(!cache_tail){
+        cache_tail = e;
+    }
+
+    cache_current_size +=size;
+
+    pthread_mutex_unlock(&cache_mutex);
+
+}
 
 
 void enque_client(int client_fd){
@@ -225,6 +347,7 @@ void handle_connect_tunnel(int client_fd, char *request) {
 void handle_clients(int client_fd) {
     char buffer[4096];
     char host[256];
+    char cache_key[1024];
     int port;
 
     int bytes = read(client_fd, buffer, sizeof(buffer) - 1);
@@ -234,16 +357,41 @@ void handle_clients(int client_fd) {
     }
 
     buffer[bytes] = '\0';
-    printf("---- HTTP REQUEST ----\n%s\n----------------------\n", buffer);
+    printf("----REQUEST ----\n%s\n----------------------\n", buffer);
 
     if (strncmp(buffer, "CONNECT", 7) == 0) {
         handle_connect_tunnel(client_fd, buffer);
         return;
     }
 
+    char method[16], path[2048], protocol[16];
+
+    if (sscanf(buffer, "%15s %2047s %15s", method, path, protocol) != 3) {
+    close(client_fd);
+    return;
+   }
+
+
     extract_host(buffer, host);
     normalise_request(buffer);
     split_host_port(host, &port);
+
+    int cacheable = (strcmp(method, "GET") == 0 && port == 80);
+
+    snprintf(cache_key, sizeof(cache_key), "%.255s%.768s", host, path);
+
+    if (cacheable) {
+    cache_entry *cached = cache_get(cache_key);
+    if (cached) {
+        printf("CACHE HIT: %s\n", cache_key);
+        write(client_fd, cached->data, cached->size);
+        close(client_fd);
+        return;
+    }
+    else{
+        printf("CACHE MISS: %s\n", cache_key);
+    }
+}
 
     printf("Host: %s | Port: %d\n", host, port);
 
@@ -278,19 +426,50 @@ void handle_clients(int client_fd) {
 
     freeaddrinfo(res);
 
-    char *pc = strstr(buffer, "Proxy-Connection:");
+    char *pc;
+    pc = strstr(buffer, "Proxy-Connection:");
     if (pc) {
         char *end = strstr(pc, "\r\n");
         if (end) memmove(pc, end + 2, strlen(end + 2) + 1);
     }
 
+    char *conn = strstr(buffer, "Connection:");
+    if (conn) {
+    char *end = strstr(conn, "\r\n");
+    if (end) memmove(conn, end + 2, strlen(end + 2) + 1);
+   }
+
+
+   strcat(buffer, "Connection: close\r\n");
+
+
     write(remote_fd, buffer, strlen(buffer));
 
-    char response[4096];
+    char response_buf[MAX_OBJECT_SIZE];
+    size_t total_bytes = 0;
+
     int n;
-    while ((n = read(remote_fd, response, sizeof(response))) > 0) {
-        write(client_fd, response, n);
-    }
+    while ((n = read(remote_fd,
+                 response_buf + total_bytes,
+                 sizeof(response_buf) - total_bytes)) > 0) {
+
+    write(client_fd,
+          response_buf + total_bytes,
+          n);
+
+    total_bytes += n;
+
+    if (total_bytes >= MAX_OBJECT_SIZE)
+        break;
+}
+
+    if (cacheable && total_bytes < MAX_OBJECT_SIZE) {
+    char *copy = malloc(total_bytes);
+    memcpy(copy, response_buf, total_bytes);
+    cache_put(cache_key, copy, total_bytes);
+   }
+
+
 
     close(client_fd);
     close(remote_fd);
