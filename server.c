@@ -15,6 +15,8 @@
 #define QUEUE_SIZE 256
 #define CACHE_MAX_SIZE (10 * 1024 * 1024) 
 #define MAX_OBJECT_SIZE (512 * 1024)
+#define DNS_CACHE_SIZE 256
+#define DNS_TTL 300
 
 
 
@@ -32,6 +34,17 @@ pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
 
+
+typedef struct dns_entry {
+    char host[256];
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
+    time_t timestamp;
+    struct dns_entry *next;
+} dns_entry;
+
+
+
 typedef struct cache_entry {
     char *key;                 
     char *data;                
@@ -41,6 +54,9 @@ typedef struct cache_entry {
     struct cache_entry *next;
 } cache_entry;
 
+dns_entry *dns_cache = NULL;
+pthread_mutex_t dns_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 cache_entry *cache_head = NULL;
 cache_entry *cache_tail = NULL;
@@ -48,6 +64,35 @@ cache_entry *cache_tail = NULL;
 size_t cache_current_size = 0;
 
 pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+int dns_cache_lookup(const char *host,struct sockaddr_storage *out,socklen_t *outlen){
+    time_t now = time(NULL);
+    pthread_mutex_lock(&dns_mutex);
+
+    for(dns_entry *e = dns_cache; e; e=e->next){
+        if(strcmp(e->host,host)==0 && now - e->timestamp < DNS_TTL){
+            memcpy(out,&e->addr,e->addrlen);
+            *outlen = e->addrlen;
+            pthread_mutex_unlock(&dns_mutex);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&dns_mutex);
+    return 0;
+}
+
+void dns_cache_store(const char *host,struct sockaddr *addr,socklen_t addrlen){
+    dns_entry *e = malloc(sizeof(dns_entry));
+    strcpy(e->host,host);
+    memcpy(&e->addr,addr,addrlen);
+    e->addrlen = addrlen;
+    e->timestamp = time(NULL);
+
+    pthread_mutex_lock(&dns_mutex);
+    e->next = dns_cache;
+    dns_cache = e;
+    pthread_mutex_unlock(&dns_mutex);
+}
 
 void cache_move_to_front(cache_entry *e){ // entry
     if(e == cache_head){
@@ -359,10 +404,6 @@ void handle_clients(int client_fd) {
     buffer[bytes] = '\0';
     printf("----REQUEST ----\n%s\n----------------------\n", buffer);
 
-    if (strncmp(buffer, "CONNECT", 7) == 0) {
-        handle_connect_tunnel(client_fd, buffer);
-        return;
-    }
 
     char method[16], path[2048], protocol[16];
 
@@ -391,11 +432,12 @@ void handle_clients(int client_fd) {
     else{
         printf("CACHE MISS: %s\n", cache_key);
     }
-}
+ }
 
     printf("Host: %s | Port: %d\n", host, port);
 
-    struct addrinfo hints, *res;
+    struct addrinfo hints, *res = NULL;
+    int used_getaddrinfo = 0;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -403,28 +445,53 @@ void handle_clients(int client_fd) {
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
 
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+    // dns cache 
+
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
+
+    if(!dns_cache_lookup(host,&addr,&addrlen)){
+        memset(&hints,0,sizeof(hints));
+        hints.ai_socktype = SOCK_STREAM;
+
+        if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+        close(client_fd);
+        return;
+       }
+
+       memcpy(&addr,res->ai_addr,res->ai_addrlen);
+       addrlen = res->ai_addrlen;
+
+       dns_cache_store(host,res->ai_addr,res->ai_addrlen);
+       used_getaddrinfo = 1;
+
+    }
+
+    
+
+    int remote_fd = socket(addr.ss_family,SOCK_STREAM,0);
+    if (remote_fd < 0) {  
+        if(used_getaddrinfo){
+        freeaddrinfo(res);
+    }
         close(client_fd);
         return;
     }
 
-    int remote_fd = socket(res->ai_family,
-                           res->ai_socktype,
-                           res->ai_protocol);
-    if (remote_fd < 0) {
+    if (connect(remote_fd, (struct sockaddr *)&addr,addrlen) < 0) {
+        if(used_getaddrinfo){
         freeaddrinfo(res);
-        close(client_fd);
-        return;
     }
-
-    if (connect(remote_fd, res->ai_addr, res->ai_addrlen) < 0) {
-        freeaddrinfo(res);
         close(client_fd);
         close(remote_fd);
         return;
     }
 
-    freeaddrinfo(res);
+    if(used_getaddrinfo){
+        freeaddrinfo(res);
+    }
+
+    
 
     char *pc;
     pc = strstr(buffer, "Proxy-Connection:");
@@ -461,7 +528,7 @@ void handle_clients(int client_fd) {
 
     if (total_bytes >= MAX_OBJECT_SIZE)
         break;
-}
+    }
 
     if (cacheable && total_bytes < MAX_OBJECT_SIZE) {
     char *copy = malloc(total_bytes);
@@ -474,6 +541,23 @@ void handle_clients(int client_fd) {
     close(client_fd);
     close(remote_fd);
 }
+
+void *connect_thread(void *arg) {
+    int client_fd = *(int *)arg;
+    free(arg);
+
+    char buffer[4096];
+    int n = read(client_fd, buffer, sizeof(buffer) - 1);
+    if (n <= 0) {
+        close(client_fd);
+        return NULL;
+    }
+
+    buffer[n] = '\0';
+    handle_connect_tunnel(client_fd, buffer);
+    return NULL;
+}
+
 
 
 int main(){
@@ -535,7 +619,26 @@ int main(){
             continue;
         }
 
-        enque_client(client_fd);
+        char peekbuf[16];
+        int n = recv(client_fd,peekbuf,sizeof(peekbuf)-1,MSG_PEEK);
+        if(n<=0){
+            close(client_fd);
+            continue;
+        }
+        peekbuf[n]='\0';
+
+        if(strncmp(peekbuf,"CONNECT",7)==0){
+            pthread_t tid;
+            int *fd = malloc(sizeof(int));
+            *fd = client_fd;
+
+            pthread_create(&tid,NULL,connect_thread,fd);
+            pthread_detach(tid);
+        }
+        else{
+            enque_client(client_fd);
+        }
+        
     }
 
     close(lisen_fd);
